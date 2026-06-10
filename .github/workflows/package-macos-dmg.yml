@@ -41,6 +41,7 @@ permissions:
 jobs:
   package:
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
 
     env:
       GH_TOKEN: ${{ github.token }}
@@ -53,16 +54,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p input work output
+
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "$SOURCE_ASSET" \
             --dir input
 
+          test -f "input/$SOURCE_ASSET"
+
       - name: Extract application
         shell: bash
         run: |
           set -euo pipefail
+
           tar -xzf "input/$SOURCE_ASSET" -C work
 
           if [[ ! -d "work/$APP_NAME" ]]; then
@@ -71,11 +77,63 @@ jobs:
             exit 1
           fi
 
+          if [[ ! -f "work/$APP_NAME/Contents/Info.plist" ]]; then
+            echo "::error::$APP_NAME does not contain Contents/Info.plist"
+            exit 1
+          fi
+
+          APP_EXECUTABLE="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "work/$APP_NAME/Contents/Info.plist"
+          )"
+
+          if [[ ! -x "work/$APP_NAME/Contents/MacOS/$APP_EXECUTABLE" ]]; then
+            echo "::error::Application executable is missing or not executable"
+            exit 1
+          fi
+
+      - name: Verify application architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_EXECUTABLE="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "work/$APP_NAME/Contents/Info.plist"
+          )"
+
+          APP_BINARY="work/$APP_NAME/Contents/MacOS/$APP_EXECUTABLE"
+          ARCHITECTURES="$(lipo -archs "$APP_BINARY")"
+
+          echo "Runner architecture: $RUNNER_ARCH"
+          echo "Application architectures: $ARCHITECTURES"
+
+          case "$RUNNER_ARCH" in
+            ARM64)
+              EXPECTED_ARCH="arm64"
+              ;;
+            X64)
+              EXPECTED_ARCH="x86_64"
+              ;;
+            *)
+              echo "::error::Unsupported runner architecture: $RUNNER_ARCH"
+              exit 1
+              ;;
+          esac
+
+          if [[ " $ARCHITECTURES " != *" $EXPECTED_ARCH "* ]]; then
+            echo "::error::Application does not contain $EXPECTED_ARCH"
+            exit 1
+          fi
+
       - name: Apply ad-hoc signature
         if: ${{ inputs.adhoc_sign }}
         shell: bash
         run: |
           set -euo pipefail
+
           codesign \
             --force \
             --deep \
@@ -96,37 +154,76 @@ jobs:
           set -euo pipefail
 
           APP_BASENAME="${APP_NAME%.app}"
-          DMG_NAME="${APP_BASENAME}-${RELEASE_TAG}.dmg"
-          DMG_ROOT="$RUNNER_TEMP/dmg-root"
 
-          rm -rf "$DMG_ROOT"
-          mkdir -p "$DMG_ROOT"
+          case "$RUNNER_ARCH" in
+            ARM64)
+              DMG_NAME="Thorium_MacOS_ARM64.dmg"
+              ;;
+            X64)
+              DMG_NAME="Thorium_MacOS_x64.dmg"
+              ;;
+            *)
+              echo "::error::Unsupported runner architecture: $RUNNER_ARCH"
+              exit 1
+              ;;
+          esac
+
+          DMG_PATH="$GITHUB_WORKSPACE/output/$DMG_NAME"
+          DMG_ROOT="$(mktemp -d "$RUNNER_TEMP/dmg-root.XXXXXX")"
+
+          cleanup() {
+            rm -rf "$DMG_ROOT"
+          }
+          trap cleanup EXIT
 
           ditto "work/$APP_NAME" "$DMG_ROOT/$APP_NAME"
           ln -s /Applications "$DMG_ROOT/Applications"
 
-          hdiutil create \
-            -volname "$APP_BASENAME" \
-            -srcfolder "$DMG_ROOT" \
-            -format ULMO \
-            -ov \
-            "output/$DMG_NAME"
+          sync
+          sleep 3
 
-          shasum -a 256 "output/$DMG_NAME" \
-            > "output/$DMG_NAME.sha256"
+          for attempt in 1 2 3; do
+            echo "Creating $DMG_NAME: attempt $attempt of 3"
+            rm -f "$DMG_PATH"
+
+            if hdiutil create \
+                -volname "$APP_BASENAME" \
+                -srcfolder "$DMG_ROOT" \
+                -format UDZO \
+                -ov \
+                "$DMG_PATH"; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::hdiutil failed after 3 attempts"
+              exit 1
+            fi
+
+            echo "::warning::hdiutil failed; retrying in 10 seconds"
+            sync
+            sleep 10
+          done
+
+          hdiutil verify "$DMG_PATH"
+          shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"
+
+          ls -lh "$DMG_PATH" "$DMG_PATH.sha256"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: thorium-macos-dmg
+          name: thorium-macos-dmg-${{ runner.arch }}
           path: output/*
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0
 
       - name: Upload DMG to release
         shell: bash
         run: |
           set -euo pipefail
+
           gh release upload "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             output/* \
