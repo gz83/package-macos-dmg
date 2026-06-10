@@ -1,0 +1,133 @@
+name: Package macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release tag containing the app archive
+        required: true
+        type: string
+
+      source_asset:
+        description: Archive containing Thorium.app
+        required: true
+        default: Thorium-mac-arm64.tar.gz
+        type: string
+
+      app_name:
+        description: Application bundle name
+        required: true
+        default: Thorium.app
+        type: string
+
+      runner:
+        description: macOS runner
+        required: true
+        default: macos-26
+        type: choice
+        options:
+          - macos-26
+          - macos-26-intel
+
+      adhoc_sign:
+        description: Apply ad-hoc signing for testing
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ${{ inputs.runner }}
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      SOURCE_ASSET: ${{ inputs.source_asset }}
+      APP_NAME: ${{ inputs.app_name }}
+
+    steps:
+      - name: Download application archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input work output
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SOURCE_ASSET" \
+            --dir input
+
+      - name: Extract application
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "input/$SOURCE_ASSET" -C work
+
+          if [[ ! -d "work/$APP_NAME" ]]; then
+            echo "::error::Archive must contain $APP_NAME at its root"
+            find work -maxdepth 3 -print
+            exit 1
+          fi
+
+      - name: Apply ad-hoc signature
+        if: ${{ inputs.adhoc_sign }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign \
+            --force \
+            --deep \
+            --sign - \
+            --timestamp=none \
+            "work/$APP_NAME"
+
+          codesign \
+            --verify \
+            --deep \
+            --strict \
+            --verbose=2 \
+            "work/$APP_NAME"
+
+      - name: Create DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_BASENAME="${APP_NAME%.app}"
+          DMG_NAME="${APP_BASENAME}-${RELEASE_TAG}.dmg"
+          DMG_ROOT="$RUNNER_TEMP/dmg-root"
+
+          rm -rf "$DMG_ROOT"
+          mkdir -p "$DMG_ROOT"
+
+          ditto "work/$APP_NAME" "$DMG_ROOT/$APP_NAME"
+          ln -s /Applications "$DMG_ROOT/Applications"
+
+          hdiutil create \
+            -volname "$APP_BASENAME" \
+            -srcfolder "$DMG_ROOT" \
+            -format ULMO \
+            -ov \
+            "output/$DMG_NAME"
+
+          shasum -a 256 "output/$DMG_NAME" \
+            > "output/$DMG_NAME.sha256"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: thorium-macos-dmg
+          path: output/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload DMG to release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            output/* \
+            --clobber
