@@ -1,0 +1,102 @@
+name: Generate macOS ICNS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release tag containing the iconset archive
+        required: true
+        type: string
+
+      icon_asset:
+        description: Archive containing Thorium.iconset or iconset PNG files
+        required: true
+        default: Thorium.iconset.tar.gz
+        type: string
+
+      runner:
+        description: macOS runner
+        required: true
+        default: macos-26
+        type: choice
+        options:
+          - macos-26
+          - macos-26-intel
+
+      upload_to_release:
+        description: Upload generated app.icns to the release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ICON_ASSET: ${{ inputs.icon_asset }}
+
+    steps:
+      - name: Download iconset archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p input output
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ICON_ASSET" \
+            --dir input
+
+          test -f "input/$ICON_ASSET"
+
+      - name: Generate app.icns
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ICON_INPUT_DIR="$RUNNER_TEMP/icon-input"
+          ICONSET_DIR="$RUNNER_TEMP/Thorium.iconset"
+          rm -rf "$ICON_INPUT_DIR" "$ICONSET_DIR"
+          mkdir -p "$ICON_INPUT_DIR"
+
+          tar -xzf "input/$ICON_ASSET" -C "$ICON_INPUT_DIR"
+          shopt -s nullglob
+          iconsets=("$ICON_INPUT_DIR"/*.iconset)
+          if [[ "${#iconsets[@]}" -eq 1 ]]; then
+            cp -R "${iconsets[0]}" "$ICONSET_DIR"
+          else
+            mkdir -p "$ICONSET_DIR"
+            cp -R "$ICON_INPUT_DIR"/* "$ICONSET_DIR"/
+          fi
+
+          iconutil -c icns "$ICONSET_DIR" -o output/app.icns
+          test -f output/app.icns
+          ls -lh output/app.icns
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thorium-app-icns-${{ runner.arch }}
+          path: output/app.icns
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload app.icns to release
+        if: ${{ inputs.upload_to_release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            output/app.icns \
+            --clobber
