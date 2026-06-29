@@ -128,6 +128,13 @@ jobs:
             exit 1
           fi
 
+      - name: Clear extended attributes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xattr -csr "work/$APP_NAME"
+
       - name: Apply ad-hoc signature
         if: ${{ inputs.adhoc_sign }}
         shell: bash
@@ -152,8 +159,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          APP_BASENAME="${APP_NAME%.app}"
 
           case "$RUNNER_ARCH" in
             ARM64)
@@ -187,9 +192,9 @@ jobs:
             rm -f "$DMG_PATH"
 
             if hdiutil create \
-                -volname "$APP_BASENAME" \
+                -volname Thorium \
                 -srcfolder "$DMG_ROOT" \
-                -format UDZO \
+                -format UDBZ \
                 -ov \
                 "$DMG_PATH"; then
               break
